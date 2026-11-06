@@ -28,6 +28,10 @@ STATE_DIR = Path.home() / ".claude" / "session-state"
 STATE_ORDER = {"waiting": 0, "working": 1, "error": 2, "done": 3, "idle": 4, "dead": 5}
 STATE_ICON = {"waiting": "◆", "working": "●", "error": "✖", "done": "✔", "idle": "·", "dead": "☠"}
 KITTY_BUNDLE = "net.kovidgoyal.kitty"
+# Alfred can't color text, so each state gets a colored icon (same palette as the TUI).
+STATE_RGB = {"waiting": (200, 70, 220), "working": (240, 190, 30), "error": (230, 60, 60),
+             "done": (60, 190, 90), "idle": (70, 130, 230), "dead": (130, 130, 130)}
+ICON_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "claude-top" / "icons"
 
 
 # ---------------------------------------------------------------- data
@@ -210,6 +214,40 @@ def progress(s):
     return " · ".join(parts)
 
 
+def state_icon(state):
+    """Path to a colored dot PNG for `state` (generated once, cached)."""
+    import struct
+    import zlib
+    rgb = STATE_RGB.get(state, STATE_RGB["dead"])
+    path = ICON_DIR / f"{state}-{'%02x%02x%02x' % rgb}.png"
+    if path.exists():
+        return str(path)
+    size, ss = 64, 4  # 4x4 supersampling for smooth edges
+    c, r = size / 2, size * 0.36
+    ring = state in ("idle", "dead")  # hollow dot for inactive states
+    rows = []
+    for y in range(size):
+        row = bytearray([0])
+        for x in range(size):
+            hit = 0
+            for sy in range(ss):
+                for sx in range(ss):
+                    d = ((x + (sx + .5) / ss - c) ** 2 + (y + (sy + .5) / ss - c) ** 2) ** .5
+                    hit += d <= r and (not ring or d >= r * 0.6)
+            row += bytes([*rgb, 255 * hit // (ss * ss)])
+        rows.append(bytes(row))
+
+    def chunk(tag, data):
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data))
+    png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(b"".join(rows))) + chunk(b"IEND", b""))
+    ICON_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_bytes(png)
+    tmp.replace(path)
+    return str(path)
+
+
 def alfred(query):
     q = (query or "").lower().strip()
     items = []
@@ -220,7 +258,8 @@ def alfred(query):
             continue
         items.append({
             "uid": s["id"],
-            "title": f"{STATE_ICON.get(s['state'], '?')} {s['project']}  ({s['profile']})  {progress(s)}",
+            "title": f"{s['project']}  ({s['profile']})  {progress(s)}",
+            "icon": {"path": state_icon(s["state"])},
             "subtitle": f"👤 {s['account_short']}  ·  {s['activity'] or s['prompt'] or s['cwd']}",
             "arg": s["id"],
             "autocomplete": s["project"],

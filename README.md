@@ -21,7 +21,7 @@ Built for macOS + [kitty](https://sw.kovidgoyal.net/kitty/), with an optional [A
 - **Jump to session** — click a row (or press enter) to focus the exact kitty pane, across tabs and OS windows.
 - **Multiple accounts** — works across separate `CLAUDE_CONFIG_DIR` profiles and shows which account each session uses.
 - **Notifications** — macOS notification when a session finishes (with a summary of the result) or needs input; clicking it jumps to the pane.
-- **Alfred workflow** — keyword `cls` lists sessions; ↩ jumps to one.
+- **Alfred workflow** — keyword `cls` lists sessions with a colored icon per state; ↩ jumps to one.
 
 ## How it works
 
