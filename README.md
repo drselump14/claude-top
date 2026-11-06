@@ -5,18 +5,18 @@ See every running [Claude Code](https://claude.com/claude-code) session at a gla
 ```
  Claude sessions   WAITING:1  working:2  done:1                      14:02:11
 
-    STATE    PROJECT              PROF ACCT TURN    TOOLS TODO  CTX   ACTIVITY
- ◆  WAITING  api-server           work alic 3m12s   14    2/5   84k   permission: Bash: npm run migrate
- ⠹  working  web-app              work alic 41s     6     -     120k  Edit: LoginForm.tsx
- ⠹  working  thesis               pers bob@ 5m02s   31    4/7   65k   [2 agents] Agent: review chapter 3
- ✔  done     infra                pers bob@ 2m10s   9     -     40k   Fixed the flaky deploy step.
+    STATE    PROJECT              PROF ACCT TURN    TODO  CTX   ACTIVITY
+ ◆  WAITING  api-server           work alic 3m12s   2/5   84k   permission: Bash: npm run migrate
+ ⠹  working  web-app              work alic 41s     -     120k  Edit: LoginForm.tsx
+ ⠹  working  thesis               pers bob@ 5m02s   4/7   65k   [2 agents] Agent: review chapter 3
+ ✔  done     infra                pers bob@ 2m10s   -     40k   Fixed the flaky deploy step.
 ```
 
 Built for macOS + [kitty](https://sw.kovidgoyal.net/kitty/), with an optional [Alfred](https://www.alfredapp.com/) frontend.
 
 ## Features
 
-- **Live session list** — state (waiting / working / done / error / idle), current tool call, turn time, tool count, todo progress, context size.
+- **Live session list** — state (waiting / working / done / error / idle), current tool call, turn time, todo progress, context size.
 - **Waiting first** — sessions blocked on a permission prompt or question sort to the top.
 - **Jump to session** — click a row (or press enter) to focus the exact kitty pane, across tabs and OS windows.
 - **Multiple accounts** — works across separate `CLAUDE_CONFIG_DIR` profiles and shows which account each session uses.

@@ -86,7 +86,7 @@ def put(win, y, x, text, attr=0):
 
 
 COLS = [("", 2), ("STATE", 8), ("PROJECT", 20), ("PROF", 4), ("ACCT", 4), ("TURN", 7),
-        ("TOOLS", 5), ("TODO", 5), ("CTX", 5), ("ACTIVITY", 0)]
+        ("TODO", 5), ("CTX", 5), ("ACTIVITY", 0)]
 LIST_Y = 3  # first data row
 
 
@@ -122,7 +122,7 @@ def draw(scr, rows, sel, colors, tick, show_dead, msg, fetched_at):
         if st == "working" and s.get("subagents"):
             act = f"[{s['subagents']} agent{'s' if s['subagents'] > 1 else ''}] {act}"
         fields = [icon, LABEL.get(st, st), s["project"], s["profile"], s.get("account_short", "?"), fmt_dur(turn),
-                  str(s.get("tools", 0)), todo, fmt_tok(s.get("ctx_tokens")), act]
+                  todo, fmt_tok(s.get("ctx_tokens")), act]
         base = curses.A_REVERSE if i == sel else 0
         if i == sel:
             put(scr, y, 0, " " * (w - 1), base)
