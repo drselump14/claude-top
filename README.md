@@ -77,6 +77,15 @@ ccs alfred [query]        # Alfred Script Filter JSON
 
 **Alfred:** `cls [query]` — filter by project, state, profile, account or prompt. ↩ focus · ⌘ show prompt · ⌥↩ forget.
 
+## Tip: own window with a bigger font
+
+kitty's font size is per OS window, so give claude-top its own kitty instance:
+
+```conf
+# kitty.conf — ctrl+space then a
+map ctrl+space>a launch --type=background kitty -o font_size=14 -o remember_window_size=no -o initial_window_width=150c -o initial_window_height=32c -T claude-top ~/.local/bin/claude-top
+```
+
 ## Notes
 
 - The hook adds roughly 70 ms per tool call; it always exits 0 and never blocks Claude.
