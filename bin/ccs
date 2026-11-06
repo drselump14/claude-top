@@ -1,0 +1,289 @@
+#!/usr/bin/env python3
+"""ccs — Claude Code sessions backend.
+
+Single source of truth for frontends (claude-top TUI, Alfred workflow, ...).
+Reads per-session state written by ~/.claude/hooks/session-state.sh.
+
+Usage:
+  ccs list [--json] [--all]     sessions, sorted waiting > working > error > done > idle
+  ccs focus <id>                focus the session's kitty pane and raise kitty
+  ccs forget <id>               delete a session's state file
+  ccs alfred [query]            Alfred Script Filter JSON
+  <id> may be any unique prefix of the session id.
+
+JSON session fields:
+  id, project, cwd, profile, account, account_short, org, state, activity, prompt, todo_done, todo_total,
+  todo_current, tools, subagents, ctx_tokens, turn_start, turn_end, turn_secs,
+  updated, updated_ago, pid, alive, kitty_window_id, kitty_listen_on, transcript_path
+"""
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+STATE_DIR = Path.home() / ".claude" / "session-state"
+STATE_ORDER = {"waiting": 0, "working": 1, "error": 2, "done": 3, "idle": 4, "dead": 5}
+STATE_ICON = {"waiting": "◆", "working": "●", "error": "✖", "done": "✔", "idle": "·", "dead": "☠"}
+KITTY_BUNDLE = "net.kovidgoyal.kitty"
+
+
+# ---------------------------------------------------------------- data
+
+def _alive(pid):
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _ctx_tokens(path):
+    """Context size of the latest assistant turn, from the transcript tail."""
+    if not path:
+        return None
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 256 * 1024))
+            lines = f.read().decode("utf-8", "ignore").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        if '"usage"' not in line:
+            continue
+        try:
+            u = json.loads(line).get("message", {}).get("usage")
+        except ValueError:
+            continue
+        if u:
+            return (u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0)
+                    + u.get("cache_creation_input_tokens", 0))
+    return None
+
+
+_acct_cache = {}  # .claude.json path -> (mtime, (email, org))
+
+
+def _account(cfg):
+    """Logged-in account for a config dir: (email, org). ~/.claude keeps it in ~/.claude.json."""
+    cfg = Path(cfg or Path.home() / ".claude")
+    candidates = [cfg / ".claude.json"]
+    if cfg == Path.home() / ".claude":
+        candidates.insert(0, Path.home() / ".claude.json")
+    for p in candidates:
+        try:
+            mtime = p.stat().st_mtime
+        except OSError:
+            continue
+        hit = _acct_cache.get(p)
+        if hit and hit[0] == mtime:
+            return hit[1]
+        try:
+            acct = json.loads(p.read_text()).get("oauthAccount") or {}
+        except (OSError, ValueError):
+            acct = {}
+        val = (acct.get("emailAddress"), acct.get("organizationName"))
+        _acct_cache[p] = (mtime, val)
+        return val
+    return (None, None)
+
+
+def _profile(cfg):
+    name = Path(cfg or "").name.lstrip(".")
+    return {"claude-work": "cwk", "claude-personal": "cpr", "claude": "main"}.get(name, name or "?")
+
+
+def _normalize(raw, path, now):
+    alive = _alive(raw.get("pid"))
+    state = raw.get("state", "idle") if alive else "dead"
+    ts, te = raw.get("turn_start"), raw.get("turn_end")
+    email, org = _account(raw.get("config_dir"))
+    return {
+        "id": raw.get("session_id", path.stem),
+        "project": Path(raw.get("cwd", "")).name or "?",
+        "cwd": raw.get("cwd", ""),
+        "profile": _profile(raw.get("config_dir")),
+        "account": email or "?",
+        "account_short": (email or "?")[:4],
+        "org": org or "",
+        "state": state,
+        "activity": raw.get("activity", ""),
+        "prompt": raw.get("prompt", ""),
+        "todo_done": raw.get("todo_done"),
+        "todo_total": raw.get("todo_total"),
+        "todo_current": raw.get("todo_current"),
+        "tools": raw.get("tools", 0),
+        "subagents": raw.get("subagents", 0),
+        "ctx_tokens": _ctx_tokens(raw.get("transcript_path")),
+        "turn_start": ts,
+        "turn_end": te,
+        "turn_secs": int((te or now) - ts) if ts else None,
+        "updated": raw.get("updated"),
+        "updated_ago": int(now - raw["updated"]) if raw.get("updated") else None,
+        "pid": raw.get("pid"),
+        "alive": alive,
+        "kitty_window_id": raw.get("kitty_window_id") or None,
+        "kitty_listen_on": raw.get("kitty_listen_on") or None,
+        "transcript_path": raw.get("transcript_path", ""),
+    }
+
+
+def sessions(include_dead=False):
+    now = time.time()
+    out = []
+    for p in STATE_DIR.glob("*.json"):
+        try:
+            s = _normalize(json.loads(p.read_text()), p, now)
+        except (OSError, ValueError):
+            continue
+        if s["alive"] or include_dead:
+            out.append(s)
+    out.sort(key=lambda s: (STATE_ORDER.get(s["state"], 9), -(s["updated"] or 0)))
+    return out
+
+
+def find(prefix):
+    matches = [p for p in STATE_DIR.glob("*.json") if p.stem.startswith(prefix)]
+    if len(matches) != 1:
+        raise SystemExit(f"ccs: {'no' if not matches else 'ambiguous'} session matching '{prefix}'")
+    return matches[0]
+
+
+# ---------------------------------------------------------------- actions
+
+def _kitty_bin():
+    return (shutil.which("kitty") or next(
+        (p for p in ("/opt/homebrew/bin/kitty", "/usr/local/bin/kitty",
+                     "/Applications/kitty.app/Contents/MacOS/kitty") if os.path.exists(p)), "kitty"))
+
+
+def focus(prefix):
+    raw = json.loads(find(prefix).read_text())
+    wid, sock = raw.get("kitty_window_id"), raw.get("kitty_listen_on")
+    if wid and sock:
+        r = subprocess.run([_kitty_bin(), "@", "--to", sock, "focus-window", "--match", f"id:{wid}"],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            subprocess.run(["open", "-b", KITTY_BUNDLE])
+            raise SystemExit(f"ccs: focus failed: {r.stderr.strip() or 'kitty pane gone?'}")
+    subprocess.run(["open", "-b", KITTY_BUNDLE])
+    if not (wid and sock):
+        raise SystemExit("ccs: session not running in kitty; raised kitty only")
+
+
+def forget(prefix):
+    find(prefix).unlink()
+
+
+# ---------------------------------------------------------------- formatting
+
+def fmt_dur(sec):
+    if sec is None:
+        return "-"
+    sec = max(0, int(sec))
+    if sec < 60:
+        return f"{sec}s"
+    if sec < 3600:
+        return f"{sec // 60}m{sec % 60:02d}s"
+    return f"{sec // 3600}h{(sec % 3600) // 60:02d}m"
+
+
+def fmt_tok(n):
+    return "-" if n is None else (f"{n / 1000:.0f}k" if n >= 1000 else str(n))
+
+
+def progress(s):
+    """Short one-line progress string shared by frontends."""
+    parts = [s["state"].upper() if s["state"] == "waiting" else s["state"], fmt_dur(s["turn_secs"])]
+    if s["todo_total"]:
+        parts.append(f"todo {s['todo_done']}/{s['todo_total']}")
+    parts.append(f"{s['tools']} tools")
+    if s["subagents"]:
+        parts.append(f"{s['subagents']} agents")
+    return " · ".join(parts)
+
+
+def alfred(query):
+    q = (query or "").lower().strip()
+    items = []
+    for s in sessions():
+        hay = " ".join([s["project"], s["state"], s["profile"], s["account"], s["org"],
+                        s["activity"], s["prompt"]]).lower()
+        if q and not all(w in hay for w in q.split()):
+            continue
+        items.append({
+            "uid": s["id"],
+            "title": f"{STATE_ICON.get(s['state'], '?')} {s['project']}  ({s['profile']})  {progress(s)}",
+            "subtitle": f"👤 {s['account_short']}  ·  {s['activity'] or s['prompt'] or s['cwd']}",
+            "arg": s["id"],
+            "autocomplete": s["project"],
+            "match": hay,
+            "text": {"copy": s["cwd"], "largetype": f"{s['prompt']}\n\n{s['activity']}"},
+            "mods": {
+                "cmd": {"subtitle": f"prompt: {s['prompt'] or '-'}", "arg": s["id"]},
+                "alt": {"subtitle": f"forget this session ({s['id'][:8]})", "arg": f"forget:{s['id']}"},
+            },
+        })
+    if not items:
+        items.append({"title": "No Claude sessions" + (f" matching '{query}'" if q else ""),
+                      "subtitle": "State comes from ~/.claude/hooks/session-state.sh", "valid": False})
+    busy = any(s["state"] in ("working", "waiting") for s in sessions())
+    out = {"items": items}
+    if busy:
+        out["rerun"] = 1  # live-refresh the list while something is running
+    return out
+
+
+def print_table(rows):
+    if not rows:
+        print("no sessions")
+        return
+    fmt = "{:<2} {:<8} {:<22} {:<5} {:<4} {:>7} {:>5} {:>6} {:>5}  {}"
+    print(fmt.format("", "STATE", "PROJECT", "PROF", "ACCT", "TURN", "TOOLS", "TODO", "CTX", "ACTIVITY"))
+    for s in rows:
+        todo = f"{s['todo_done']}/{s['todo_total']}" if s["todo_total"] else "-"
+        print(fmt.format(STATE_ICON.get(s["state"], "?"), s["state"], s["project"][:22], s["profile"],
+                         s["account_short"],
+                         fmt_dur(s["turn_secs"]), s["tools"], todo, fmt_tok(s["ctx_tokens"]),
+                         s["activity"][:80]))
+
+
+# ---------------------------------------------------------------- cli
+
+def main(argv):
+    cmd = argv[0] if argv else "list"
+    args = argv[1:]
+    if cmd == "list":
+        rows = sessions(include_dead="--all" in args)
+        if "--json" in args:
+            json.dump(rows, sys.stdout)
+            print()
+        else:
+            print_table(rows)
+    elif cmd == "focus" and args:
+        focus(args[0])
+    elif cmd == "forget" and args:
+        forget(args[0])
+    elif cmd == "alfred":
+        json.dump(alfred(" ".join(args)), sys.stdout)
+    elif cmd == "alfred-action" and args:
+        # Alfred passes "forget:<id>" (alt) or "<id>" (enter / cmd)
+        a = args[0]
+        forget(a[7:]) if a.startswith("forget:") else focus(a)
+    elif cmd in ("-h", "--help", "help"):
+        print(__doc__)
+    else:
+        print(__doc__, file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

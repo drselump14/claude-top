@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+"""claude-top: live TUI of all running Claude Code sessions (frontend for `ccs`).
+
+All data and actions come from the `ccs` backend:
+  ccs list --json [--all]   ccs focus <id>   ccs forget <id>
+
+Keys / mouse:
+  click, enter       focus the session's kitty pane
+  wheel, j/k, ↑/↓    move          g/G  top/bottom
+  a                  show/hide dead sessions
+  x                  forget selected
+  q/esc              quit
+"""
+import curses
+import json
+import os
+import shutil
+import subprocess
+import time
+from pathlib import Path
+
+REFRESH = 1.0
+SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+ICON = {"waiting": "◆", "done": "✔", "error": "✖", "idle": "·", "dead": "☠"}
+LABEL = {"waiting": "WAITING"}
+CCS = shutil.which("ccs") or str(Path(__file__).resolve().with_name("ccs"))
+
+
+# ---------------------------------------------------------------- backend calls
+
+def ccs(*args):
+    r = subprocess.run([CCS, *args], capture_output=True, text=True)
+    return r.returncode, r.stdout, r.stderr.strip()
+
+
+def load(show_dead):
+    code, out, err = ccs("list", "--json", *(["--all"] if show_dead else []))
+    if code != 0:
+        return [], err or "ccs list failed"
+    try:
+        return json.loads(out), None
+    except ValueError:
+        return [], "bad JSON from ccs"
+
+
+# ---------------------------------------------------------------- formatting
+
+def fmt_dur(sec):
+    if sec is None:
+        return "-"
+    sec = max(0, int(sec))
+    if sec < 60:
+        return f"{sec}s"
+    if sec < 3600:
+        return f"{sec // 60}m{sec % 60:02d}s"
+    return f"{sec // 3600}h{(sec % 3600) // 60:02d}m"
+
+
+def fmt_tok(n):
+    return "-" if n is None else (f"{n / 1000:.0f}k" if n >= 1000 else str(n))
+
+
+def init_colors():
+    curses.start_color()
+    curses.use_default_colors()
+    pairs = {"working": curses.COLOR_YELLOW, "waiting": curses.COLOR_MAGENTA, "done": curses.COLOR_GREEN,
+             "error": curses.COLOR_RED, "idle": curses.COLOR_BLUE, "dead": curses.COLOR_RED,
+             "dim": curses.COLOR_WHITE, "head": curses.COLOR_CYAN}
+    colors = {}
+    for i, (k, c) in enumerate(pairs.items(), start=1):
+        curses.init_pair(i, c, -1)
+        colors[k] = curses.color_pair(i)
+    colors["dim"] |= curses.A_DIM
+    colors["waiting"] |= curses.A_BOLD
+    return colors
+
+
+def put(win, y, x, text, attr=0):
+    h, w = win.getmaxyx()
+    if y >= h or x >= w:
+        return
+    try:
+        win.addnstr(y, x, text, max(0, w - x - 1), attr)
+    except curses.error:
+        pass
+
+
+COLS = [("", 2), ("STATE", 8), ("PROJECT", 20), ("PROF", 4), ("ACCT", 4), ("TURN", 7),
+        ("TOOLS", 5), ("TODO", 5), ("CTX", 5), ("ACTIVITY", 0)]
+LIST_Y = 3  # first data row
+
+
+def draw(scr, rows, sel, colors, tick, show_dead, msg, fetched_at):
+    scr.erase()
+    h, w = scr.getmaxyx()
+    # live-tick the turn timer between backend polls
+    drift = time.time() - fetched_at
+    counts = {}
+    for s in rows:
+        counts[s["state"]] = counts.get(s["state"], 0) + 1
+    order = ["waiting", "working", "error", "done", "idle", "dead"]
+    summary = "  ".join(f"{LABEL.get(k, k)}:{counts[k]}" for k in order if counts.get(k))
+    put(scr, 0, 1, "Claude sessions", colors["head"] | curses.A_BOLD)
+    put(scr, 0, 18, summary or "no sessions", colors["dim"])
+    put(scr, 0, max(18, w - 26), time.strftime("%H:%M:%S") + ("  [all]" if show_dead else ""), colors["dim"])
+
+    x = 1
+    for name, width in COLS:
+        put(scr, 2, x, name, colors["dim"] | curses.A_BOLD)
+        x += width + 1 if width else 0
+
+    list_h = max(1, h - 12)
+    top = max(0, sel - list_h + 1)
+    for row, s in enumerate(rows[top:top + list_h]):
+        i, y, st = top + row, LIST_Y + row, s["state"]
+        icon = ICON.get(st) or SPIN[tick % len(SPIN)]
+        turn = s["turn_secs"]
+        if turn is not None and st == "working":
+            turn += drift
+        todo = f"{s['todo_done']}/{s['todo_total']}" if s.get("todo_total") else "-"
+        act = s.get("activity") or ""
+        if st == "working" and s.get("subagents"):
+            act = f"[{s['subagents']} agent{'s' if s['subagents'] > 1 else ''}] {act}"
+        fields = [icon, LABEL.get(st, st), s["project"], s["profile"], s.get("account_short", "?"), fmt_dur(turn),
+                  str(s.get("tools", 0)), todo, fmt_tok(s.get("ctx_tokens")), act]
+        base = curses.A_REVERSE if i == sel else 0
+        if i == sel:
+            put(scr, y, 0, " " * (w - 1), base)
+        x = 1
+        for (name, width), val in zip(COLS, fields):
+            attr = base | (colors.get(st, 0) if name in ("", "STATE") else 0)
+            if width:
+                put(scr, y, x, val[:width].ljust(width), attr)
+                x += width + 1
+            else:
+                put(scr, y, x, val, attr)
+
+    if rows:
+        s = rows[sel]
+        y0 = h - 8
+        put(scr, y0, 0, "─" * (w - 1), colors["dim"])
+        now_line = (f"todo: {s['todo_current']}  |  " if s.get("todo_current") else "") + (s.get("activity") or "-")
+        lines = [
+            ("account ", f"{s.get('account', '?')}  ·  {s.get('org') or '-'}  ({s['profile']})"),
+            ("prompt  ", s.get("prompt") or "-"),
+            ("now     ", now_line),
+            ("cwd     ", s.get("cwd", "")),
+            ("session ", f"{s['id']}  pid {s.get('pid')}  kitty pane {s.get('kitty_window_id') or '-'}"
+                         f"  updated {fmt_dur((s.get('updated_ago') or 0) + drift)} ago"),
+        ]
+        for j, (k, v) in enumerate(lines):
+            put(scr, y0 + 1 + j, 1, k, colors["dim"])
+            put(scr, y0 + 1 + j, 10, v, colors.get(s["state"], 0) if j == 2 else 0)
+
+    help_ = "click/enter focus  wheel/j/k move  a all  x forget  q quit"
+    put(scr, h - 1, 1, msg or help_, colors["error"] if msg else colors["dim"])
+    scr.refresh()
+    return top, list_h
+
+
+# ---------------------------------------------------------------- main loop
+
+def main(scr):
+    curses.curs_set(0)
+    scr.timeout(250)  # redraw 4x/s for spinner; poll backend every REFRESH
+    colors = init_colors()
+    curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
+    curses.mouseinterval(0)
+    wheel_up = getattr(curses, "BUTTON4_PRESSED", 0)
+    wheel_down = getattr(curses, "BUTTON5_PRESSED", 0x200000)
+    clicks = curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED | curses.BUTTON1_DOUBLE_CLICKED
+
+    sel, tick, show_dead = 0, 0, False
+    msg, msg_until = "", 0.0
+    rows, fetched_at = [], 0.0
+
+    def flash(text):
+        nonlocal msg, msg_until
+        msg, msg_until = text, time.time() + 3
+
+    def act(verb):
+        if not rows:
+            return
+        code, _, err = ccs(verb, rows[sel]["id"])
+        if code != 0:
+            flash(err or f"ccs {verb} failed")
+
+    while True:
+        if time.time() - fetched_at >= REFRESH:
+            rows, err = load(show_dead)
+            fetched_at = time.time()
+            if err:
+                flash(err)
+        sel = min(sel, max(0, len(rows) - 1))
+        if msg and time.time() > msg_until:
+            msg = ""
+        top, list_h = draw(scr, rows, sel, colors, tick, show_dead, msg, fetched_at)
+        tick += 1
+
+        k = scr.getch()
+        if k in (ord("q"), 27):
+            return
+        if k == curses.KEY_MOUSE:
+            try:
+                _, _mx, my, _, bstate = curses.getmouse()
+            except curses.error:
+                continue
+            if bstate & wheel_up:
+                sel = max(sel - 1, 0)
+            elif bstate & wheel_down:
+                sel = min(sel + 1, max(0, len(rows) - 1))
+            elif bstate & clicks and LIST_Y <= my < LIST_Y + list_h and top + my - LIST_Y < len(rows):
+                sel = top + my - LIST_Y
+                act("focus")
+        elif k in (ord("j"), curses.KEY_DOWN):
+            sel = min(sel + 1, max(0, len(rows) - 1))
+        elif k in (ord("k"), curses.KEY_UP):
+            sel = max(sel - 1, 0)
+        elif k == ord("g"):
+            sel = 0
+        elif k == ord("G"):
+            sel = max(0, len(rows) - 1)
+        elif k == ord("a"):
+            show_dead, fetched_at = not show_dead, 0
+        elif k == ord("x"):
+            act("forget")
+            fetched_at = 0
+        elif k in (10, 13, curses.KEY_ENTER):
+            act("focus")
+
+
+if __name__ == "__main__":
+    os.environ.setdefault("ESCDELAY", "25")
+    try:
+        curses.wrapper(main)
+    except KeyboardInterrupt:
+        pass
